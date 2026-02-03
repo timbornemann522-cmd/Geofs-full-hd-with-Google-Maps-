@@ -1,0 +1,254 @@
+// ==UserScript==
+// @name         GeoFS – Google Maps HD Satellite
+// @namespace    https://github.com/geofs-google-hd
+// @version      1.2.0
+// @description  Ersetzte die unscharfen Standardbilder durch Google Maps HD-Satellitenbilder
+// @author       Claude / Anthropic
+// @match        https://www.geo-fs.com/geofs.php*
+// @match        https://geo-fs.com/geofs.php*
+// @match        https://*.geo-fs.com/geofs.php*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=geo-fs.com
+// @grant        none
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  // ──────────────────────────────────────────────
+  // 1.  TILE-SOURCE DEFINITIONS
+  // ──────────────────────────────────────────────
+  // lyrs=s  → satellite only (highest quality, no labels)
+  // lyrs=y  → hybrid (satellite + road labels)
+  const SOURCES = {
+    google: {
+      label: "🌍 Google Satellite",
+      url: "https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+      subdomains: ["mt0", "mt1", "mt2", "mt3"],
+      maxLevel: 21
+    },
+    googleHybrid: {
+      label: "🗺️ Google Hybrid",
+      url: "https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+      subdomains: ["mt0", "mt1", "mt2", "mt3"],
+      maxLevel: 21
+    },
+    apple: {
+      label: "🍎 Apple Maps",
+      url: "https://maps.apple.com/maps/aerial/tile/v1/tile?z={z}&x={x}&y={y}",
+      subdomains: [],
+      maxLevel: 19
+    },
+    esri: {
+      label: "🌐 Esri World Imagery",
+      url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      subdomains: [],
+      maxLevel: 19
+    },
+    osm: {
+      label: "📌 OpenStreetMap",
+      url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+      subdomains: ["a", "b", "c"],
+      maxLevel: 19
+    }
+  };
+
+  // ──────────────────────────────────────────────
+  // 2.  STATE
+  // ──────────────────────────────────────────────
+  let currentSource = "google";                 // default
+  let injected       = false;                   // only run once
+
+  // ──────────────────────────────────────────────
+  // 3.  CORE – swap the imagery provider
+  // ──────────────────────────────────────────────
+  function applyImagery(sourceKey) {
+    const src = SOURCES[sourceKey];
+    if (!src) return console.warn("[GeoFS-HD] Unbekannte Quelle:", sourceKey);
+
+    // Cesium & geofs global muss verfügbar sein
+    const Cesium = window.Cesium || (window.geofs && window.geofs.api && window.geofs.api.Cesium);
+    if (!Cesium || !Cesium.UrlTemplateImageryProvider) {
+      return console.warn("[GeoFS-HD] Cesium noch nicht geladen – wird erneut versucht.");
+    }
+
+    const viewer = window.geofs && window.geofs.api && window.geofs.api.viewer;
+    if (!viewer) {
+      return console.warn("[GeoFS-HD] geofs.api.viewer noch nicht verfügbar.");
+    }
+
+    // ── Altes Layer entfernen (wenn vorhanden) ──
+    const layers = viewer.imageryLayers;
+    if (layers.length > 0) {
+      // Erstes Layer = Basis-Imagery → entfernen
+      layers.remove(layers.get(0), false);
+    }
+
+    // ── Neuen Provider erstellen ──
+    const providerOptions = {
+      url: src.url,
+      maximumLevel: src.maxLevel,
+      hasAlphaChannel: false,
+      credit: new Cesium.Credit(src.label)
+    };
+
+    if (src.subdomains.length > 0) {
+      providerOptions.subdomains = src.subdomains;
+    }
+
+    const provider = new Cesium.UrlTemplateImageryProvider(providerOptions);
+
+    // ── Als erstes Layer einfügen (unter anderen Layers) ──
+    layers.add(
+      Cesium.ImageryLayer.fromImagerySources
+        ? Cesium.ImageryLayer.fromImagerySources(provider)   // Cesium >= 1.104
+        : new Cesium.ImageryLayer(provider),                 // ältere Versionen
+      0                                                       // Index 0 = Basis
+    );
+
+    // ── Alternativ über geofs.api direkt setzen (Fallback-Pfad) ──
+    if (window.geofs && window.geofs.api) {
+      window.geofs.api.imageryProvider = provider;
+    }
+
+    // HD-Flag setzen damit GeoFS keine eigene Imagery überschreibt
+    window.geofsNewHDState = true;
+    document.body.classList.add("geofs-hd");
+
+    currentSource = sourceKey;
+    console.log("[GeoFS-HD] ✅ Imagery umgeschaltet auf:", src.label);
+  }
+
+  // ──────────────────────────────────────────────
+  // 4.  UI – Schwebendes Bedienfeld
+  // ──────────────────────────────────────────────
+  function createUI() {
+    // ── Styles ──
+    const style = document.createElement("style");
+    style.textContent = `
+      #geofs-hd-panel {
+        position: fixed;
+        bottom: 52px;
+        left: 12px;
+        z-index: 99999;
+        background: rgba(20, 24, 34, 0.92);
+        border: 1px solid rgba(100, 140, 255, 0.45);
+        border-radius: 10px;
+        padding: 10px 14px 8px;
+        font-family: 'Segoe UI', Arial, sans-serif;
+        font-size: 13px;
+        color: #e0e4f0;
+        box-shadow: 0 4px 18px rgba(0,0,0,0.55);
+        min-width: 195px;
+        user-select: none;
+        transition: opacity 0.25s;
+      }
+      #geofs-hd-panel.minimised { padding: 6px 12px; min-width: 0; }
+      #geofs-hd-panel .hd-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: pointer;
+        margin-bottom: 6px;
+        font-weight: 600;
+        font-size: 13px;
+        color: #7cb8ff;
+        letter-spacing: 0.5px;
+      }
+      #geofs-hd-panel .hd-title span { font-size: 11px; opacity: 0.6; }
+      #geofs-hd-panel .hd-body { overflow: hidden; }
+      #geofs-hd-panel.minimised .hd-body { display: none; }
+      #geofs-hd-panel .hd-btn {
+        display: block;
+        width: 100%;
+        text-align: left;
+        background: rgba(40, 55, 80, 0.7);
+        border: 1px solid transparent;
+        border-radius: 6px;
+        color: #c8d0e0;
+        padding: 5px 10px;
+        margin-bottom: 4px;
+        cursor: pointer;
+        font-size: 12.5px;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      #geofs-hd-panel .hd-btn:hover { background: rgba(60, 90, 140, 0.75); }
+      #geofs-hd-panel .hd-btn.active {
+        border-color: rgba(100, 160, 255, 0.7);
+        background: rgba(40, 70, 120, 0.8);
+        color: #fff;
+      }
+      #geofs-hd-panel .hd-btn:last-child { margin-bottom: 0; }
+    `;
+    document.head.appendChild(style);
+
+    // ── Panel ──
+    const panel = document.createElement("div");
+    panel.id = "geofs-hd-panel";
+    panel.innerHTML = `
+      <div class="hd-title">
+        <div>📷 HD Imagery</div>
+        <span>▲</span>
+      </div>
+      <div class="hd-body" id="geofs-hd-body"></div>
+    `;
+    document.body.appendChild(panel);
+
+    // ── Buttons ──
+    const body = panel.querySelector("#geofs-hd-body");
+    Object.entries(SOURCES).forEach(([key, src]) => {
+      const btn = document.createElement("button");
+      btn.className = "hd-btn" + (key === currentSource ? " active" : "");
+      btn.dataset.source = key;
+      btn.textContent = src.label;
+      btn.addEventListener("click", () => {
+        applyImagery(key);
+        document.querySelectorAll("#geofs-hd-panel .hd-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+      });
+      body.appendChild(btn);
+    });
+
+    // ── Minimise-Toggle ──
+    panel.querySelector(".hd-title").addEventListener("click", () => {
+      panel.classList.toggle("minimised");
+      panel.querySelector(".hd-title span").textContent =
+        panel.classList.contains("minimised") ? "▼" : "▲";
+    });
+  }
+
+  // ──────────────────────────────────────────────
+  // 5.  BOOTSTRAP – warten bis GeoFS bereit
+  // ──────────────────────────────────────────────
+  function tryInit() {
+    // Prüfe ob geofs und Cesium verfügbar sind
+    if (
+      window.geofs &&
+      window.geofs.api &&
+      window.geofs.api.viewer &&
+      (window.Cesium || (window.geofs.api && window.geofs.api.Cesium))
+    ) {
+      if (injected) return;
+      injected = true;
+
+      // Kleines Delay damit GeoFS sein eigenes Imagery vollständig geladen hat
+      setTimeout(() => {
+        console.log("[GeoFS-HD] 🚀 GeoFS erkannt – initialisiere HD-Imagery…");
+        applyImagery(currentSource);
+        createUI();
+      }, 800);
+    }
+  }
+
+  // Polling: alle 300 ms prüfen (max. ~30 s)
+  let attempts = 0;
+  const poller = setInterval(() => {
+    tryInit();
+    if (injected || ++attempts > 100) clearInterval(poller);
+  }, 300);
+
+  // Auch auf das DOMContentLoaded / load Event hören
+  window.addEventListener("load", tryInit);
+
+})(); // IIFE-Ende
